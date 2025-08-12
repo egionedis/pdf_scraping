@@ -1,10 +1,10 @@
 # br_escola_downloader.py
 # Downloader for https://vestibular.brasilescola.uol.com.br/downloads
 # - Region page -> per-university page -> per-link dump
-# - Windows-safe folder names (strips :, /, etc.; trims length; avoids reserved names)
-# - Accepts region filters like "centro-oeste" or "centrooeste"
-# - Resumable downloads, retries, archive extraction (7-Zip preferred), nested extraction, long-path safe
-# - Prints per-item start/done + total elapsed timer
+# - ALSO supports extra downloads pages via --pages (treated as top-level "regions", e.g., OBMEP)
+# - Windows-safe folder names, resumable downloads, nested extraction with 7-Zip
+# - Long-path safe on Windows (\\?\ prefix)
+# - Progress logs + total elapsed timer
 
 import os, re, pathlib, argparse, shutil, subprocess, zipfile, rarfile, threading, uuid, time
 from urllib.parse import urljoin, urlparse, unquote
@@ -26,10 +26,17 @@ OUT_ROOT = pathlib.Path("downloads")
 SEVENZ_PATH = None
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; BrasilEscolaDownloader/7.6)",
+    "User-Agent": "Mozilla/5.0 (compatible; BrasilEscolaDownloader/7.8)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
-REGION_SLUGS = {"centro-oeste","nordeste","norte","sudeste","sul"}
+
+# Site region slugs (note: "centrooeste" has no hyphen on the site)
+REGION_SLUGS = {"centrooeste","nordeste","norte","sudeste","sul"}
+
+# Optional friendly renames for long page slugs
+FRIENDLY_PAGE_SLUG = {
+    "olimpiada-brasileira-matematica-escolas-publicas": "obmep",
+}
 
 WORK_BASE = pathlib.Path("w")
 WORK_BASE.mkdir(exist_ok=True)
@@ -75,6 +82,7 @@ def soup_get(session, url):
 
 # ---------- discovery ----------
 def collect_region_pages(session):
+    """Return [(slug, url)] for region pages present on START."""
     soup = soup_get(session, START)
     out = []
     for a in soup.select('a[href*="/downloads/"][href$=".htm"]'):
@@ -97,6 +105,7 @@ def derive_alias_from_h4(h4_text: str, uni_name: str) -> str:
     return uni_name.strip()
 
 def collect_universities_in_region(session, region_url):
+    """On a region page, collect links to per-university downloads pages -> [(display, url, alias)]."""
     soup = soup_get(session, region_url)
     out = []
     for a in soup.select('a[href*="/downloads/"][href$=".htm"]'):
@@ -116,12 +125,10 @@ def collect_universities_in_region(session, region_url):
             uniq.append(rec); seen.add(rec[1])
     return uniq
 
-# Robust cleaner for “xxxx downloads realizados” junk
+# ---------- label cleanup / safe paths ----------
 DL_RX = re.compile(
     r"""(?ix)
-    (?:^|\s)
-    \d{1,3}(?:[.\s]\d{3})*
-    \s+downloads?\s+realizad[oa]s\.?
+    (?:^|\s)\d{1,3}(?:[.\s]\d{3})*\s+downloads?\s+realizad[oa]s\.?
     """)
 
 def _clean_label(label: str, fallback: str) -> str:
@@ -134,7 +141,6 @@ def _clean_label(label: str, fallback: str) -> str:
         s = fallback
     return s or fallback or "arquivo"
 
-# ---------- safe path segments for Windows ----------
 INVALID_CHARS_RX = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 WIN_RESERVED = {
     "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
@@ -142,8 +148,8 @@ WIN_RESERVED = {
 }
 def safe_segment(name: str, fallback: str = "arquivo", max_len: int = 120) -> str:
     s = _clean_label(name, fallback)
-    s = INVALID_CHARS_RX.sub(" ", s)            # strip invalid chars (colon, slash, etc.)
-    s = re.sub(r"\s{2,}", " ", s).strip(" .")   # collapse/trim
+    s = INVALID_CHARS_RX.sub(" ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip(" .")
     if not s:
         s = fallback
     if len(s) > max_len:
@@ -153,16 +159,17 @@ def safe_segment(name: str, fallback: str = "arquivo", max_len: int = 120) -> st
     return s
 
 # ---------- item collection ----------
-def collect_items(session, uni_url):
-    soup = soup_get(session, uni_url)
+def collect_items(session, page_url):
+    """From any downloads page, collect actual downloadable items -> [(label, url)]."""
+    soup = soup_get(session, page_url)
 
     def is_download_href(h):
-        h = (h or "").strip()
-        return ("/baixar/" in h) or h.lower().endswith((".pdf",".zip",".rar"))
+        h = (h or "").strip().lower()
+        return ("/baixar/" in h) or h.endswith((".pdf",".zip",".rar"))
 
     anchors = [a for a in soup.select("a[href]") if is_download_href(a.get("href"))]
 
-    # Map URL -> all human texts; pick the longest for that URL
+    # Map URL -> texts; pick the longest per-URL
     url_to_texts = {}
     for a in anchors:
         href = urljoin(BASE, a.get("href",""))
@@ -189,6 +196,26 @@ def collect_items(session, uni_url):
             uniq.append((label, url)); seen.add(url)
     return uniq
 
+# ---------- filename ext sniff ----------
+def _sniff_name_and_ext(session, file_url, headers):
+    try:
+        with session.get(file_url, headers=headers, stream=True, timeout=30) as r0:
+            r0.raise_for_status()
+            cd = r0.headers.get("Content-Disposition","")
+            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+            resp_name = unquote(m.group(1)) if m else os.path.basename(urlparse(r0.url or file_url).path)
+            ext = os.path.splitext(resp_name)[1].lower()
+            if not ext:
+                ct = (r0.headers.get("Content-Type","") or "").lower()
+                if "zip" in ct: ext = ".zip"
+                elif "rar" in ct: ext = ".rar"
+                elif "pdf" in ct: ext = ".pdf"
+            return resp_name, ext or ".pdf"
+    except Exception:
+        resp_name = os.path.basename(urlparse(file_url).path) or "arquivo"
+        ext = os.path.splitext(resp_name)[1].lower() or ".pdf"
+        return resp_name, ext
+
 # ---------- download with resume ----------
 def download_with_resume(session, url, headers, dest_path, max_retries=6, chunk_size=128*1024, timeout=120):
     tmp = dest_path.with_suffix(dest_path.suffix + f".part.{uuid.uuid4().hex}")
@@ -213,7 +240,8 @@ def download_with_resume(session, url, headers, dest_path, max_retries=6, chunk_
                 mode = "ab" if downloaded > 0 else "wb"
                 with open(_win_long(tmp), mode) as f:
                     for chunk in r.iter_content(chunk_size=chunk_size):
-                        if chunk: f.write(chunk); downloaded += len(chunk)
+                        if chunk:
+                            f.write(chunk); downloaded += len(chunk)
                 break
         except (requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ConnectionError,
@@ -308,22 +336,7 @@ def dump_link(session, label: str, file_url: str, referer: str, dest_dir: pathli
     headers = dict(HEADERS)
     if referer: headers["Referer"] = referer
 
-    # sniff filename/ext
-    try:
-        with session.get(file_url, headers=headers, stream=True, timeout=30) as r0:
-            r0.raise_for_status()
-            cd = r0.headers.get("Content-Disposition","")
-            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
-            resp_name = unquote(m.group(1)) if m else os.path.basename(urlparse(r0.url or file_url).path)
-            ext = os.path.splitext(resp_name)[1].lower()
-            if not ext:
-                ct = (r0.headers.get("Content-Type","") or "").lower()
-                if "zip" in ct: ext = ".zip"
-                elif "rar" in ct: ext = ".rar"
-                elif "pdf" in ct: ext = ".pdf"
-    except Exception:
-        resp_name = os.path.basename(urlparse(file_url).path) or "arquivo"
-        ext = os.path.splitext(resp_name)[1].lower() or ".pdf"
+    resp_name, ext = _sniff_name_and_ext(session, file_url, headers)
 
     # direct non-archive
     if ext not in (".zip",".rar"):
@@ -354,7 +367,6 @@ def dump_link(session, label: str, file_url: str, referer: str, dest_dir: pathli
         elif ext==".rar": ok = _extract_rar(tmp_arch, work)
 
     if not ok:
-        # Could not extract with any method; save the raw archive so nothing is lost
         os.makedirs(_win_long(dest_dir), exist_ok=True)
         raw_name = safe_segment(os.path.basename(resp_name) or tmp_arch.name)
         dest = dest_dir / raw_name
@@ -384,15 +396,47 @@ def dump_link(session, label: str, file_url: str, referer: str, dest_dir: pathli
 def _norm_region_key(x: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (x or '').lower())
 
-def crawl(regions_filter=None, unis_filter=None, workers=4):
+def coerce_to_download_page(x: str):
+    """Accept slug or full URL. Return (slug, url)."""
+    x = (x or "").strip()
+    if not x:
+        return None
+    if x.lower().startswith(("http://","https://")):
+        url  = x
+        slug = os.path.splitext(os.path.basename(urlparse(url).path))[0]
+    else:
+        slug = os.path.splitext(os.path.basename(urlparse(x).path))[0]
+        url  = f"{BASE}/downloads/{slug}.htm"
+    return (slug, url)
+
+def crawl(regions_filter=None, unis_filter=None, extra_pages=None, workers=4):
     t0_total = time.perf_counter()
     os.makedirs(_win_long(OUT_ROOT), exist_ok=True)
     s = make_session()
 
-    regions = collect_region_pages(s)
+    # 1) Regions: only if user passed --regions
     if regions_filter:
+        _all = collect_region_pages(s)
         want = {_norm_region_key(r) for r in regions_filter}
-        regions = [(n,u) for (n,u) in regions if _norm_region_key(n) in want]
+        regions = [(n,u) for (n,u) in _all if _norm_region_key(n) in want]
+    else:
+        regions = []
+
+    # 2) Extra pages treated as regions
+    extras = []
+    if extra_pages:
+        for x in extra_pages:
+            cu = coerce_to_download_page(x)
+            if cu:
+                slug, url = cu
+                slug = FRIENDLY_PAGE_SLUG.get(slug, slug)
+                extras.append((slug, url))
+
+    # Merge + de-dupe by URL
+    if extras:
+        seen = {u for (_,u) in regions}
+        regions += [(n,u) for (n,u) in extras if u not in seen]
+
     if not regions:
         _print("No regions found."); return
 
@@ -400,11 +444,29 @@ def crawl(regions_filter=None, unis_filter=None, workers=4):
     for region_slug, region_url in regions:
         _print(f"[Region] {region_slug} -> {region_url}")
         uni_blocks = collect_universities_in_region(s, region_url)
+
+        # If NO per-university pages, treat page as its own region folder
+        if not uni_blocks:
+            items_here = collect_items(s, region_url)
+            if items_here:
+                base_dir = OUT_ROOT / safe_segment(region_slug, "pagina")
+                os.makedirs(_win_long(base_dir), exist_ok=True)
+                _print(f"  [Direct] {region_slug} -> {len(items_here)} links")
+                for label, url in items_here:
+                    dest_dir = base_dir / safe_segment(label, "arquivo")
+                    tasks.append((label, url, region_url, dest_dir))
+                continue
+            else:
+                _print("  (no files on page)")
+                continue
+
+        # Normal flow: region page lists multiple universities
         if unis_filter:
             keys = [u.lower() for u in unis_filter]
             uni_blocks = [(n,u,a) for (n,u,a) in uni_blocks if any(k in n.lower() for k in keys)]
         if not uni_blocks:
-            _print("  (no universities matched)"); continue
+            _print("  (no universities matched)")
+            continue
 
         for uni_display_from_region, uni_url, uni_alias in uni_blocks:
             uni_dir   = safe_segment(uni_display_from_region, "universidade")
@@ -443,8 +505,9 @@ def crawl(regions_filter=None, unis_filter=None, workers=4):
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Brasil Escola downloader (uni folder → alias subfolder → per-link dump)")
-    ap.add_argument("--regions", nargs="*", help="Filter region slugs (e.g., sudeste | nordeste | centro-oeste/centrooeste)")
+    ap.add_argument("--regions", nargs="*", help="Filter region slugs (e.g., sudeste | nordeste | centrooeste)")
     ap.add_argument("--unis", nargs="*", help="Filter university names (substring match)")
+    ap.add_argument("--pages", nargs="*", help="Extra downloads pages (slug or full URL), treated as regions")
     ap.add_argument("--workers", type=int, default=4, help="Parallel downloads (default 4)")
     ap.add_argument("--sevenzip", help="Path to 7z.exe (optional)")
     return ap.parse_args()
@@ -459,7 +522,15 @@ if __name__ == "__main__":
         _print("[warn] 7-Zip not found. RAR extraction may be limited. Install 7-Zip or pass --sevenzip PATH.")
 
     crawl(
-        regions_filter=set([r for r in args.regions]) if args.regions else None,
-        unis_filter=set([u for u in args.unis]) if args.unis else None,
+        regions_filter=set(args.regions) if args.regions else None,
+        unis_filter=set(args.unis) if args.unis else None,
+        extra_pages=list(args.pages) if args.pages else None,
         workers=args.workers,
     )
+
+
+#python br_escola_downloader.py `
+#  --regions centrooeste nordeste norte sudeste sul `
+#  --pages olimpiada-brasileira-matematica-escolas-publicas `
+#  --workers 6 `
+#  --sevenzip "C:\Program Files\7-Zip\7z.exe"
