@@ -1,5 +1,15 @@
+# === project outputs ===
 downloads/
 w/
 
+# === Python noise ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.env.*
 
-
+# === OS/editor ===
+.DS_Store
+Thumbs.db

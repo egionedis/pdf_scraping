@@ -1,3 +1,11 @@
+# br_escola_downloader.py
+# Downloader for https://vestibular.brasilescola.uol.com.br/downloads
+# - Region page -> per-university page -> per-link dump
+# - Windows-safe folder names (strips :, /, etc.; trims length; avoids reserved names)
+# - Accepts region filters like "centro-oeste" or "centrooeste"
+# - Resumable downloads, retries, archive extraction (7-Zip preferred), nested extraction, long-path safe
+# - Prints per-item start/done + total elapsed timer
+
 import os, re, pathlib, argparse, shutil, subprocess, zipfile, rarfile, threading, uuid, time
 from urllib.parse import urljoin, urlparse, unquote
 import http.client as httplib
@@ -6,7 +14,6 @@ from time import sleep
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter, Retry
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Silence TLS warnings (we disable cert verification below)
 import urllib3
@@ -19,7 +26,7 @@ OUT_ROOT = pathlib.Path("downloads")
 SEVENZ_PATH = None
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; BrasilEscolaDownloader/7.5)",
+    "User-Agent": "Mozilla/5.0 (compatible; BrasilEscolaDownloader/7.6)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 REGION_SLUGS = {"centro-oeste","nordeste","norte","sudeste","sul"}
@@ -116,6 +123,7 @@ DL_RX = re.compile(
     \d{1,3}(?:[.\s]\d{3})*
     \s+downloads?\s+realizad[oa]s\.?
     """)
+
 def _clean_label(label: str, fallback: str) -> str:
     s = (label or "").strip()
     if not s:
@@ -126,6 +134,25 @@ def _clean_label(label: str, fallback: str) -> str:
         s = fallback
     return s or fallback or "arquivo"
 
+# ---------- safe path segments for Windows ----------
+INVALID_CHARS_RX = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+WIN_RESERVED = {
+    "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+    "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+}
+def safe_segment(name: str, fallback: str = "arquivo", max_len: int = 120) -> str:
+    s = _clean_label(name, fallback)
+    s = INVALID_CHARS_RX.sub(" ", s)            # strip invalid chars (colon, slash, etc.)
+    s = re.sub(r"\s{2,}", " ", s).strip(" .")   # collapse/trim
+    if not s:
+        s = fallback
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" .")
+    if s.upper() in WIN_RESERVED:
+        s = "_" + s
+    return s
+
+# ---------- item collection ----------
 def collect_items(session, uni_url):
     soup = soup_get(session, uni_url)
 
@@ -135,7 +162,7 @@ def collect_items(session, uni_url):
 
     anchors = [a for a in soup.select("a[href]") if is_download_href(a.get("href"))]
 
-    # Map URL -> all human texts; we'll pick the longest for that URL
+    # Map URL -> all human texts; pick the longest for that URL
     url_to_texts = {}
     for a in anchors:
         href = urljoin(BASE, a.get("href",""))
@@ -204,7 +231,7 @@ def find_7z(explicit: str | None = None) -> str | None:
     if env and pathlib.Path(env).exists(): return env
     for c in (r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"):
         if pathlib.Path(c).exists(): return c
-    return shutil.which("7z") or shutil.which("7za")
+    return shutil.which("7z") or shutil.which("7z.exe") or shutil.which("7za")
 
 def _extract_with_7z(src: pathlib.Path, out_dir: pathlib.Path) -> bool:
     sevenz = SEVENZ_PATH or find_7z(None)
@@ -301,7 +328,8 @@ def dump_link(session, label: str, file_url: str, referer: str, dest_dir: pathli
     # direct non-archive
     if ext not in (".zip",".rar"):
         os.makedirs(_win_long(dest_dir), exist_ok=True)
-        dest = dest_dir / os.path.basename(resp_name)
+        safe_name = safe_segment(os.path.basename(resp_name) or "arquivo")
+        dest = dest_dir / safe_name
         if not exists_long(dest):
             tmp = WORK_BASE / f"__tmp_{uuid.uuid4().hex}{ext or ''}"
             _ = download_with_resume(session, file_url, headers, tmp)
@@ -328,7 +356,8 @@ def dump_link(session, label: str, file_url: str, referer: str, dest_dir: pathli
     if not ok:
         # Could not extract with any method; save the raw archive so nothing is lost
         os.makedirs(_win_long(dest_dir), exist_ok=True)
-        dest = dest_dir / (os.path.basename(resp_name) or tmp_arch.name)
+        raw_name = safe_segment(os.path.basename(resp_name) or tmp_arch.name)
+        dest = dest_dir / raw_name
         if not exists_long(dest):
             try:
                 shutil.copy2(_win_long(tmp_arch), _win_long(dest))
@@ -352,6 +381,9 @@ def dump_link(session, label: str, file_url: str, referer: str, dest_dir: pathli
     _print(f"[done]  {label} (archive) in {dt:0.1f}s")
 
 # ---------- crawl with total timer ----------
+def _norm_region_key(x: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', (x or '').lower())
+
 def crawl(regions_filter=None, unis_filter=None, workers=4):
     t0_total = time.perf_counter()
     os.makedirs(_win_long(OUT_ROOT), exist_ok=True)
@@ -359,8 +391,8 @@ def crawl(regions_filter=None, unis_filter=None, workers=4):
 
     regions = collect_region_pages(s)
     if regions_filter:
-        keys = {r.lower() for r in regions_filter}
-        regions = [(n,u) for (n,u) in regions if n.lower() in keys]
+        want = {_norm_region_key(r) for r in regions_filter}
+        regions = [(n,u) for (n,u) in regions if _norm_region_key(n) in want]
     if not regions:
         _print("No regions found."); return
 
@@ -375,17 +407,19 @@ def crawl(regions_filter=None, unis_filter=None, workers=4):
             _print("  (no universities matched)"); continue
 
         for uni_display_from_region, uni_url, uni_alias in uni_blocks:
-            base_dir = OUT_ROOT / region_slug / uni_display_from_region / (uni_alias or uni_display_from_region)
+            uni_dir   = safe_segment(uni_display_from_region, "universidade")
+            alias_dir = safe_segment(uni_alias or uni_display_from_region, uni_dir)
+            base_dir  = OUT_ROOT / region_slug / uni_dir / alias_dir
             os.makedirs(_win_long(base_dir), exist_ok=True)
 
             items = collect_items(s, uni_url)
             _print(f"  [University] {uni_display_from_region} (alias: {uni_alias}) -> {len(items)} links")
             if not items:
-                _print("    (no files)"); 
+                _print("    (no files)")
                 continue
 
             for label, url in items:
-                dest_dir = base_dir / label
+                dest_dir = base_dir / safe_segment(label, "arquivo")
                 tasks.append((label, url, uni_url, dest_dir))
 
     if not tasks:
@@ -393,6 +427,7 @@ def crawl(regions_filter=None, unis_filter=None, workers=4):
 
     _print(f"[Queue] {len(tasks)} items total\n")
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         futs = [ex.submit(dump_link, s, label, url, referer, dest_dir)
                 for (label, url, referer, dest_dir) in tasks]
@@ -408,7 +443,7 @@ def crawl(regions_filter=None, unis_filter=None, workers=4):
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Brasil Escola downloader (uni folder → alias subfolder → per-link dump)")
-    ap.add_argument("--regions", nargs="*", help="Filter region slugs (e.g., sudeste)")
+    ap.add_argument("--regions", nargs="*", help="Filter region slugs (e.g., sudeste | nordeste | centro-oeste/centrooeste)")
     ap.add_argument("--unis", nargs="*", help="Filter university names (substring match)")
     ap.add_argument("--workers", type=int, default=4, help="Parallel downloads (default 4)")
     ap.add_argument("--sevenzip", help="Path to 7z.exe (optional)")
